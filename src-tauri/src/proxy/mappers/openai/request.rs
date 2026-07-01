@@ -111,7 +111,7 @@ pub fn transform_openai_request(
     project_id: &str,
     mapped_model: &str,
     token: Option<&ProxyToken>,
-) -> (Value, String, usize) {
+) -> (Value, String, usize, String) {
     let session_id =
         crate::proxy::session_manager::SessionManager::extract_openai_session_id(request);
     let message_count = request.messages.len();
@@ -955,7 +955,7 @@ pub fn transform_openai_request(
         ));
     }
 
-    let final_body = json!({
+    let mut final_body = json!({
         "project": project_id,
         // [CHANGED v4.1.24] Structured requestId: agent/<session>/<turn> to match official format
         "requestId": format!("agent/antigravity/{}/{}", &session_id[..session_id.len().min(8)], message_count),
@@ -986,10 +986,24 @@ pub fn transform_openai_request(
             &session_id[..session_id.len().min(8)],
             message_count
         );
-        short_hash.to_string()
+        hash
     };
 
-    (final_body, session_id, message_count)
+    // [CACHE] 尝试利用显式缓存：查询 prefix_hash 对应的 Gemini cache_id
+    // 若命中，注入 cachedContent 参数，告知 Gemini 服务端复用已缓存的前缀
+    let cache_manager = crate::proxy::cache_manager::global_cache_manager();
+    if let Some(cache_name) = cache_manager.lookup(&prefix_hash) {
+        if let Some(req_obj) = final_body["request"].as_object_mut() {
+            req_obj.insert("cachedContent".to_string(), json!(cache_name));
+            tracing::info!(
+                "[Cache-Opt] Explicit cache HIT: prefix_hash={} cache_name={}",
+                &prefix_hash[..prefix_hash.len().min(16)],
+                cache_name
+            );
+        }
+    }
+
+    (final_body, session_id, message_count, prefix_hash)
 }
 
 fn enforce_uppercase_types(value: &mut Value) {

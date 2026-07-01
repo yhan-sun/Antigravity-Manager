@@ -236,8 +236,8 @@ pub async fn handle_chat_completions(
         last_email = Some(email.clone());
         info!("✓ Using account: {} (type: {})", email, config.request_type);
 
-        // 4. 转换请求 (返回内容包含 session_id 和 message_count)
-        let (gemini_body, session_id, message_count) = transform_openai_request(
+        // 4. 转换请求 (返回内容包含 session_id, message_count, prefix_hash)
+        let (gemini_body, session_id, message_count, _prefix_hash) = transform_openai_request(
             &openai_req,
             &project_id,
             &mapped_model,
@@ -550,6 +550,24 @@ pub async fn handle_chat_completions(
                 .json()
                 .await
                 .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Parse error: {}", e)))?;
+
+            // [CACHE] 从 Gemini 响应中提取缓存信息，关闭反馈循环
+            // 若 cachedContentTokenCount > 0 表示隐式缓存命中
+            if let Some(usage) = gemini_resp.get("usageMetadata") {
+                let cached = usage
+                    .get("cachedContentTokenCount")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                if cached > 0 {
+                    let cm = crate::proxy::cache_manager::global_cache_manager();
+                    cm.record_implicit_hit(&_prefix_hash);
+                    tracing::info!(
+                        "[Cache-Opt] Implicit cache HIT: prefix_hash={} cached_tokens={}",
+                        &_prefix_hash[.._prefix_hash.len().min(16)],
+                        cached
+                    );
+                }
+            }
 
             let openai_response =
                 transform_openai_response(&gemini_resp, Some(&session_id), message_count);
@@ -1485,7 +1503,7 @@ pub async fn handle_completions(
         info!("✓ Using account: {} (type: {})", email, config.request_type);
 
         let proxy_token = token_manager.get_token_by_id(&account_id);
-        let (gemini_body, session_id, message_count) = transform_openai_request(
+        let (gemini_body, session_id, message_count, _prefix_hash) = transform_openai_request(
             &openai_req,
             &project_id,
             &mapped_model,
