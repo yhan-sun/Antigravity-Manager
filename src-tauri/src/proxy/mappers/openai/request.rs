@@ -1067,35 +1067,30 @@ pub fn transform_openai_request(
         antigravity_identity
     };
 
-    // [HYBRID] 检查用户是否已提供身份。Codex 请求必须保留 Codex 身份，不能再叠加 Antigravity。
-    let user_has_proxy_identity = system_instructions
-        .iter()
-        .any(|s| s.contains("You are Antigravity") || s.contains("You are a search engine bot"));
-    let user_has_codex_identity = system_instructions
-        .iter()
-        .any(|s| s.contains("You are Codex"));
-
-    let mut parts = Vec::new();
-
-    // 1. Antigravity 身份 (如果需要, 作为独立 Part 插入)
-    if !user_has_codex_identity && !user_has_proxy_identity {
-        parts.push(json!({"text": proxy_identity}));
-    }
-
-    // 2. [NEW] 注入全局系统提示词 (紧跟 Antigravity 身份之后)
+    // [STRUCTURED] Gemini/Antigravity-style single systemInstruction.
+    // Keep short-term memory in `contents` and executable powers in `tools`;
+    // this block only describes stable identity, environment summaries and
+    // compact skill/memory indexes.
     let global_prompt_config = crate::proxy::config::get_global_system_prompt();
-    if global_prompt_config.enabled && !global_prompt_config.content.trim().is_empty() {
-        parts.push(json!({"text": global_prompt_config.content}));
-    }
-
-    // 3. 追加用户指令 (作为独立 Parts)
-    for inst in system_instructions {
-        parts.push(json!({"text": inst}));
-    }
+    let global_prompt =
+        if global_prompt_config.enabled && !global_prompt_config.content.trim().is_empty() {
+            Some(global_prompt_config.content.as_str())
+        } else {
+            None
+        };
+    let structured_system_instruction =
+        super::context_blocks::build_official_style_system_instruction(
+            &system_instructions,
+            Some(proxy_identity),
+            global_prompt,
+            &config.request_type,
+            mapped_model,
+            &session_id,
+        );
 
     inner_request["systemInstruction"] = json!({
-        "role": "user",
-        "parts": parts
+        "role": "system",
+        "parts": [{ "text": structured_system_instruction }]
     });
 
     if config.inject_google_search {
