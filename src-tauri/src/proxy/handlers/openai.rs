@@ -83,12 +83,26 @@ fn codex_ledger_from_body(
     (ledger, markers)
 }
 
-fn prefix_with_step_marker(marker: Option<String>, content: String) -> String {
-    match marker {
-        Some(marker) if content.trim().is_empty() => marker,
-        Some(marker) => format!("{}\n{}", marker, content),
-        None => content,
+fn strip_codex_step_markers(content: &str) -> String {
+    let mut cleaned = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("[codex-turn:")
+            && trimmed.contains(" step:")
+            && trimmed.contains(" type:")
+            && trimmed.ends_with(']')
+        {
+            continue;
+        }
+        cleaned.push(line);
     }
+    cleaned.join("\n").trim().to_string()
+}
+
+fn prefix_with_step_marker(_marker: Option<String>, content: String) -> String {
+    // Step markers are useful in debug ledgers, but must not be visible to
+    // Gemini. If they enter the prompt, the model learns to emit them as text.
+    strip_codex_step_markers(&content)
 }
 
 pub async fn handle_chat_completions(
@@ -1379,7 +1393,7 @@ pub async fn handle_completions(
 
                         messages.push(json!({
                             "role": "assistant",
-                            "content": step_marker.unwrap_or_default(),
+                            "content": "",
                             "tool_calls": [
                                 {
                                     "id": call_id,
@@ -4472,7 +4486,7 @@ fn convert_codex_to_openai_request(mut body: Value) -> Value {
 
                     messages.push(json!({
                         "role": "assistant",
-                        "content": step_marker.unwrap_or_default(),
+                        "content": "",
                         "tool_calls": [{
                             "id": call_id,
                             "type": "function",

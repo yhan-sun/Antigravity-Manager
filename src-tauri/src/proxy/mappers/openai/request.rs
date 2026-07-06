@@ -1055,22 +1055,23 @@ pub fn transform_openai_request(
         });
     }
 
-    // [NEW] Antigravity 身份指令 (原始简化版)
-    let antigravity_identity = "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.\n\
+    // Fallback identity only. Codex system/developer prompts are preserved by
+    // context_blocks and must not be overwritten or summarized by the proxy.
+    let fallback_antigravity_identity = "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.\n\
     You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.\n\
     **Absolute paths only**\n\
     **Proactiveness**";
-    let web_search_identity = "You are a search engine bot. You will be given a query from a user. Your task is to search the web for relevant information that will help the user. You MUST perform a web search. Do not respond or interact with the user, please respond as if they typed the query into a search bar.";
-    let proxy_identity = if config.request_type == "web_search" {
-        web_search_identity
+    let fallback_web_search_identity = "You are a search engine bot. You will be given a query from a user. Your task is to search the web for relevant information that will help the user. You MUST perform a web search. Do not respond or interact with the user, please respond as if they typed the query into a search bar.";
+    let fallback_identity = if config.request_type == "web_search" {
+        fallback_web_search_identity
     } else {
-        antigravity_identity
+        fallback_antigravity_identity
     };
 
-    // [STRUCTURED] Gemini/Antigravity-style single systemInstruction.
-    // Keep short-term memory in `contents` and executable powers in `tools`;
-    // this block only describes stable identity, environment summaries and
-    // compact skill/memory indexes.
+    // Gemini/Antigravity-style section tags, with Codex prompt text preserved.
+    // This is classification only: no summarization, no skill rewrites, no
+    // injected behavior except the fallback identity when the request has no
+    // system/developer instructions at all.
     let global_prompt_config = crate::proxy::config::get_global_system_prompt();
     let global_prompt =
         if global_prompt_config.enabled && !global_prompt_config.content.trim().is_empty() {
@@ -1081,7 +1082,7 @@ pub fn transform_openai_request(
     let structured_system_instruction =
         super::context_blocks::build_official_style_system_instruction(
             &system_instructions,
-            Some(proxy_identity),
+            Some(fallback_identity),
             global_prompt,
             &config.request_type,
             mapped_model,
