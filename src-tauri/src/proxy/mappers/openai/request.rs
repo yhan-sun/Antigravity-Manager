@@ -471,14 +471,14 @@ pub fn transform_openai_request(
                 match content {
                     OpenAIContent::String(s) => {
                         if !s.is_empty() {
-                            parts.push(json!({"text": s}));
+                            parts.extend(crate::proxy::mappers::common_utils::parse_markdown_images_to_parts(s));
                         }
                     }
                     OpenAIContent::Array(blocks) => {
                         for block in blocks {
                             match block {
                                 OpenAIContentBlock::Text { text } => {
-                                    parts.push(json!({"text": text}));
+                                    parts.extend(crate::proxy::mappers::common_utils::parse_markdown_images_to_parts(text));
                                 }
                                 OpenAIContentBlock::ImageUrl { image_url } => {
                                     if image_url.url.starts_with("data:") {
