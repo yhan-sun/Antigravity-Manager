@@ -520,6 +520,14 @@ fn extract_apply_patch_input(args: &Value) -> String {
         .unwrap_or_else(|| serde_json::to_string(args).unwrap_or_default())
 }
 
+fn inject_seq(mut event: Value, seq: &mut u64) -> Value {
+    if let Some(obj) = event.as_object_mut() {
+        obj.insert("sequence_number".to_string(), json!(*seq));
+    }
+    *seq += 1;
+    event
+}
+
 pub fn create_codex_sse_stream<S, E>(
     mut gemini_stream: Pin<Box<S>>,
     _model: String,
@@ -542,15 +550,18 @@ where
         .collect();
     let response_id = format!("resp-{}", random_str);
     let message_item_id = format!("msg_{}_0", &random_str[..16]);
-
     let stream = async_stream::stream! {
+        let mut sequence_number: u64 = 0;
+
         // 1. response.created
         let created_ev = json!({ "type": "response.created", "response": { "id": &response_id, "object": "response", "status": "in_progress", "output": [] } });
+        let created_ev = inject_seq(created_ev, &mut sequence_number);
         yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&created_ev).unwrap())));
 
         let mut message_item_emitted = false;
-        let mut in_thought_block = false;
-        let mut emitted_thought_header = false;
+        let mut reasoning_open = false;
+        let mut current_summary_index: u32 = 0;
+        let mut active_reasoning_item_id = String::new();
 
         let mut emitted_tool_calls = std::collections::HashSet::new();
         let mut accumulated_text = String::new();
@@ -559,6 +570,7 @@ where
         let mut final_outputs_map: std::collections::BTreeMap<u32, serde_json::Value> = std::collections::BTreeMap::new();
         let mut next_output_index: u32 = 0;
         let mut message_output_index: u32 = 0;
+        let mut reasoning_output_index: u32 = 0;
         let mut final_usage: Option<super::models::OpenAIUsage> = None;
         let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(15));
         heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -592,50 +604,123 @@ where
                                                 if let Some(parts) = candidate.get("content").and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
                                                     for part in parts {
                                                         let is_thought = part.get("thought").and_then(|v| v.as_bool()).unwrap_or(false);
+                                                        
+                                                        // 切换到正文或工具时，若思考区开着，则先闭合思考区
+                                                        let is_text_or_tool = part.get("text").is_some() || part.get("functionCall").is_some() || part.get("inlineData").is_some();
+                                                        if is_text_or_tool && !is_thought && reasoning_open {
+                                                            let text_done = json!({
+                                                                "type": "response.reasoning_summary_text.done",
+                                                                "item_id": &active_reasoning_item_id,
+                                                                "output_index": reasoning_output_index,
+                                                                "summary_index": current_summary_index,
+                                                                "text": &accumulated_thinking
+                                                            });
+                                                            let text_done = inject_seq(text_done, &mut sequence_number);
+                                                            yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&text_done).unwrap())));
+
+                                                            let part_done = json!({
+                                                                "type": "response.reasoning_summary_part.done",
+                                                                "item_id": &active_reasoning_item_id,
+                                                                "output_index": reasoning_output_index,
+                                                                "summary_index": current_summary_index,
+                                                                "part": {
+                                                                    "type": "summary_text",
+                                                                    "text": &accumulated_thinking
+                                                                }
+                                                            });
+                                                            let part_done = inject_seq(part_done, &mut sequence_number);
+                                                            yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&part_done).unwrap())));
+
+                                                            let reasoning_item = json!({
+                                                                "type": "reasoning",
+                                                                "status": "completed",
+                                                                "id": &active_reasoning_item_id,
+                                                                "summary": [{
+                                                                    "type": "summary_text",
+                                                                    "text": &accumulated_thinking
+                                                                }]
+                                                            });
+
+                                                            let done_ev = json!({
+                                                                "type": "response.output_item.done",
+                                                                "output_index": reasoning_output_index,
+                                                                "item": &reasoning_item
+                                                            });
+                                                            let done_ev = inject_seq(done_ev, &mut sequence_number);
+                                                            yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&done_ev).unwrap())));
+
+                                                            final_outputs_map.insert(reasoning_output_index, reasoning_item);
+                                                            reasoning_open = false;
+                                                            current_summary_index += 1;
+                                                        }
+
                                                         if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
                                                             let clean_text = text.replace("<think>\n", "").replace("<think>", "").replace("\n</think>", "").replace("</think>", "");
                                                             if !clean_text.is_empty() {
-                                                                if !message_item_emitted {
-                                                                    message_item_emitted = true;
-                                                                    message_output_index = next_output_index;
-                                                                    next_output_index += 1;
-                                                                    let output_item_added = json!({"type": "response.output_item.added", "output_index": message_output_index, "item": {"id": &message_item_id, "type": "message", "role": "assistant", "phase": "commentary", "status": "in_progress", "content": []}});
-                                                                    yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&output_item_added).unwrap())));
-                                                                    let content_part_added = json!({"type": "response.content_part.added", "item_id": &message_item_id, "output_index": message_output_index, "content_index": 0, "part": {"type": "output_text", "text": ""}});
-                                                                    yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&content_part_added).unwrap())));
-                                                                }
-
-                                                                let mut chunk_to_emit = String::new();
-
                                                                 if is_thought {
+                                                                    if !reasoning_open {
+                                                                        reasoning_output_index = next_output_index;
+                                                                        next_output_index += 1;
+                                                                        active_reasoning_item_id = format!("item-{}-{}", &random_str[..16], current_summary_index);
+                                                                        accumulated_thinking.clear();
+
+                                                                        let output_item_added = json!({"type": "response.output_item.added", "output_index": reasoning_output_index, "item": {"id": &active_reasoning_item_id, "type": "reasoning", "status": "in_progress", "summary": []}});
+                                                                        let output_item_added = inject_seq(output_item_added, &mut sequence_number);
+                                                                        yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&output_item_added).unwrap())));
+
+                                                                        let part_added = json!({"type": "response.reasoning_summary_part.added", "item_id": &active_reasoning_item_id, "output_index": reasoning_output_index, "summary_index": current_summary_index, "part": {"type": "summary_text", "text": ""}});
+                                                                        let part_added = inject_seq(part_added, &mut sequence_number);
+                                                                        yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&part_added).unwrap())));
+
+                                                                        reasoning_open = true;
+
+                                                                        let prefix = "**Thinking**\n\n";
+                                                                        accumulated_thinking.push_str(prefix);
+                                                                        let prefix_ev = json!({
+                                                                            "type": "response.reasoning_summary_text.delta",
+                                                                            "item_id": &active_reasoning_item_id,
+                                                                            "output_index": reasoning_output_index,
+                                                                            "summary_index": current_summary_index,
+                                                                            "delta": prefix
+                                                                        });
+                                                                        let prefix_ev = inject_seq(prefix_ev, &mut sequence_number);
+                                                                        yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&prefix_ev).unwrap())));
+                                                                    }
+
                                                                     accumulated_thinking.push_str(&clean_text);
-                                                                    if !in_thought_block {
-                                                                        in_thought_block = true;
-                                                                        if !emitted_thought_header {
-                                                                            emitted_thought_header = true;
-                                                                        } else {
-                                                                            chunk_to_emit.push_str("\n> ");
-                                                                        }
-                                                                    }
-                                                                    chunk_to_emit.push_str(&clean_text.replace("\n", "\n> "));
+                                                                    let delta_ev = json!({
+                                                                        "type": "response.reasoning_summary_text.delta",
+                                                                        "item_id": &active_reasoning_item_id,
+                                                                        "output_index": reasoning_output_index,
+                                                                        "summary_index": current_summary_index,
+                                                                        "delta": clean_text
+                                                                    });
+                                                                    let delta_ev = inject_seq(delta_ev, &mut sequence_number);
+                                                                    yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&delta_ev).unwrap())));
                                                                 } else {
-                                                                    if in_thought_block {
-                                                                        in_thought_block = false;
-                                                                        chunk_to_emit.push_str("\n\n");
+                                                                    if !message_item_emitted {
+                                                                        message_item_emitted = true;
+                                                                        message_output_index = next_output_index;
+                                                                        next_output_index += 1;
+                                                                        let output_item_added = json!({"type": "response.output_item.added", "output_index": message_output_index, "item": {"id": &message_item_id, "type": "message", "role": "assistant", "phase": "commentary", "status": "in_progress", "content": []}});
+                                                                        let output_item_added = inject_seq(output_item_added, &mut sequence_number);
+                                                                        yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&output_item_added).unwrap())));
+                                                                        let content_part_added = json!({"type": "response.content_part.added", "item_id": &message_item_id, "output_index": message_output_index, "content_index": 0, "part": {"type": "output_text", "text": ""}});
+                                                                        let content_part_added = inject_seq(content_part_added, &mut sequence_number);
+                                                                        yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&content_part_added).unwrap())));
                                                                     }
-                                                                    chunk_to_emit.push_str(&clean_text);
+
+                                                                    accumulated_text.push_str(&clean_text);
+                                                                    let delta_ev = json!({
+                                                                        "type": "response.output_text.delta",
+                                                                        "item_id": &message_item_id,
+                                                                        "output_index": message_output_index,
+                                                                        "content_index": 0,
+                                                                        "delta": clean_text
+                                                                    });
+                                                                    let delta_ev = inject_seq(delta_ev, &mut sequence_number);
+                                                                    yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&delta_ev).unwrap())));
                                                                 }
-
-                                                                accumulated_text.push_str(&chunk_to_emit);
-
-                                                                let delta_ev = json!({
-                                                                    "type": "response.output_text.delta",
-                                                                    "item_id": &message_item_id,
-                                                                    "output_index": message_output_index,
-                                                                    "content_index": 0,
-                                                                    "delta": chunk_to_emit
-                                                                });
-                                                                yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&delta_ev).unwrap())));
                                                             }
                                                         }
                                                         if let Some(sig) = part.get("thoughtSignature").or(part.get("thought_signature")).and_then(|s| s.as_str()) {
@@ -752,6 +837,7 @@ where
                                                                     "output_index": tool_output_index,
                                                                     "item": added_item
                                                                 });
+                                                                let added_ev = inject_seq(added_ev, &mut sequence_number);
                                                                 yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&added_ev).unwrap())));
 
                                                                 let mut delta_ev = json!({
@@ -763,6 +849,7 @@ where
                                                                 if is_custom_tool {
                                                                     delta_ev["call_id"] = json!(&call_id);
                                                                 }
+                                                                let delta_ev = inject_seq(delta_ev, &mut sequence_number);
                                                                 yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&delta_ev).unwrap())));
 
                                                                 let mut args_done_ev = json!({
@@ -776,6 +863,7 @@ where
                                                                 } else {
                                                                     args_done_ev["arguments"] = json!(&final_args_str);
                                                                 }
+                                                                let args_done_ev = inject_seq(args_done_ev, &mut sequence_number);
                                                                 yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&args_done_ev).unwrap())));
 
                                                                 let done_ev = json!({
@@ -783,6 +871,7 @@ where
                                                                     "output_index": tool_output_index,
                                                                     "item": item_obj
                                                                 });
+                                                                let done_ev = inject_seq(done_ev, &mut sequence_number);
                                                                 yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&done_ev).unwrap())));
 
                                                                 let tc_val = item_obj.clone();
@@ -805,12 +894,10 @@ where
                                                                         },
                                                                     );
                                                                 }
-                                                                // [FIX] 按发出顺序追踪输出项
                                                                 final_outputs_map.insert(tool_output_index, tc_val);
                                                             }
                                                         }
                                                     }
-
                                                 }
 
                                                 // 处理 groundingMetadata (搜索引文)
@@ -843,8 +930,10 @@ where
                                                             message_output_index = next_output_index;
                                                             next_output_index += 1;
                                                             let output_item_added = json!({"type": "response.output_item.added", "output_index": message_output_index, "item": {"id": &message_item_id, "type": "message", "role": "assistant", "phase": "commentary", "status": "in_progress", "content": []}});
+                                                            let output_item_added = inject_seq(output_item_added, &mut sequence_number);
                                                             yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&output_item_added).unwrap())));
                                                             let content_part_added = json!({"type": "response.content_part.added", "item_id": &message_item_id, "output_index": message_output_index, "content_index": 0, "part": {"type": "output_text", "text": ""}});
+                                                            let content_part_added = inject_seq(content_part_added, &mut sequence_number);
                                                             yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&content_part_added).unwrap())));
                                                         }
                                                         accumulated_text.push_str(&grounding_text);
@@ -855,6 +944,7 @@ where
                                                             "content_index": 0,
                                                             "delta": grounding_text
                                                         });
+                                                        let delta_ev = inject_seq(delta_ev, &mut sequence_number);
                                                         yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&delta_ev).unwrap())));
                                                     }
                                                 }
@@ -868,17 +958,68 @@ where
                         None => break,
                     }
                 }
-                _ = heartbeat_interval.tick() => { yield Ok::<Bytes, String>(Bytes::from(": ping\n\n")); }
+                _ = heartbeat_interval.tick() => {
+                    yield Ok::<Bytes, String>(Bytes::from(": ping\n\n"));
+                }
             }
+        }
+
+        // 最终收尾时，若思考区还开着，则先闭合思考区
+        if reasoning_open {
+            let text_done = json!({
+                "type": "response.reasoning_summary_text.done",
+                "item_id": &active_reasoning_item_id,
+                "output_index": reasoning_output_index,
+                "summary_index": current_summary_index,
+                "text": &accumulated_thinking
+            });
+            let text_done = inject_seq(text_done, &mut sequence_number);
+            yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&text_done).unwrap())));
+
+            let part_done = json!({
+                "type": "response.reasoning_summary_part.done",
+                "item_id": &active_reasoning_item_id,
+                "output_index": reasoning_output_index,
+                "summary_index": current_summary_index,
+                "part": {
+                    "type": "summary_text",
+                    "text": &accumulated_thinking
+                }
+            });
+            let part_done = inject_seq(part_done, &mut sequence_number);
+            yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&part_done).unwrap())));
+
+            let reasoning_item = json!({
+                "type": "reasoning",
+                "status": "completed",
+                "id": &active_reasoning_item_id,
+                "summary": [{
+                    "type": "summary_text",
+                    "text": &accumulated_thinking
+                }]
+            });
+
+            let done_ev = json!({
+                "type": "response.output_item.done",
+                "output_index": reasoning_output_index,
+                "item": &reasoning_item
+            });
+            let done_ev = inject_seq(done_ev, &mut sequence_number);
+            yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&done_ev).unwrap())));
+
+            final_outputs_map.insert(reasoning_output_index, reasoning_item);
+            reasoning_open = false;
         }
 
         let mut emit_empty = false;
         if !message_item_emitted && final_outputs_map.is_empty() {
             emit_empty = true;
-            message_output_index = next_output_index;
+            message_output_index = message_output_index;
             let output_item_added = json!({"type": "response.output_item.added", "output_index": message_output_index, "item": {"id": &message_item_id, "type": "message", "role": "assistant", "phase": "commentary", "status": "in_progress", "content": []}});
+            let output_item_added = inject_seq(output_item_added, &mut sequence_number);
             yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&output_item_added).unwrap())));
             let content_part_added = json!({"type": "response.content_part.added", "item_id": &message_item_id, "output_index": message_output_index, "content_index": 0, "part": {"type": "output_text", "text": ""}});
+            let content_part_added = inject_seq(content_part_added, &mut sequence_number);
             yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&content_part_added).unwrap())));
         }
 
@@ -890,6 +1031,7 @@ where
                 "content_index": 0,
                 "text": &accumulated_text
             });
+            let text_done = inject_seq(text_done, &mut sequence_number);
             yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&text_done).unwrap())));
 
             let content_part_done = json!({
@@ -902,6 +1044,7 @@ where
                     "text": &accumulated_text
                 }
             });
+            let content_part_done = inject_seq(content_part_done, &mut sequence_number);
             yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&content_part_done).unwrap())));
 
             let message_item = json!({
@@ -921,6 +1064,7 @@ where
                 "output_index": message_output_index,
                 "item": message_item.clone()
             });
+            let output_item_done = inject_seq(output_item_done, &mut sequence_number);
             yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&output_item_done).unwrap())));
 
             final_outputs_map.insert(message_output_index, message_item);
@@ -968,6 +1112,7 @@ where
             }
         }
 
+        let completed_ev = inject_seq(completed_ev, &mut sequence_number);
         yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&completed_ev).unwrap())));
     };
     Box::pin(stream)
